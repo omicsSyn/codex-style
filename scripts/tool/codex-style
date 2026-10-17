@@ -76,17 +76,14 @@ def locate_codex_binary() -> Path:
         )
 
     package_name, triple = target
+    # Follow Node's ancestor node_modules search without executing the launcher.
+    # This includes nested, sibling/hoisted, and symlinked package-manager layouts.
     candidates = [
-        package_root
-        / "node_modules"
-        / "@openai"
-        / package_name
-        / "vendor"
-        / triple
-        / "bin"
-        / "codex",
-        package_root / "vendor" / triple / "bin" / "codex",
+        parent / "node_modules" / "@openai" / package_name / "vendor" / triple / "bin" / "codex"
+        for parent in (entrypoint.parent, *entrypoint.parent.parents)
+        if parent.name != "node_modules"
     ]
+    candidates.append(package_root / "vendor" / triple / "bin" / "codex")
     for candidate in candidates:
         if candidate.is_file():
             return require_native_binary(candidate.resolve())
@@ -119,13 +116,23 @@ def load_state(version: str) -> dict | None:
 
 def write_state(version: str, state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    sync_directory(STATE_DIR.parent)
     path = state_path(version)
     temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    with temporary.open('w', encoding='utf-8') as handle:
+        handle.write(json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(temporary, path)
+    sync_directory(STATE_DIR)
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def install_binary(candidate: Path, destination: Path, expected_version: str) -> None:
@@ -135,7 +142,10 @@ def install_binary(candidate: Path, destination: Path, expected_version: str) ->
         temporary.chmod(0o755)
         if codex_version(temporary) != expected_version:
             raise RuntimeError("Candidate and installed Codex versions differ.")
+        with temporary.open('rb') as handle:
+            os.fsync(handle.fileno())
         os.replace(temporary, destination)
+        sync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -156,10 +166,17 @@ def create_backup(binary: Path, version: str) -> tuple[Path, str]:
     directory.mkdir(parents=True, exist_ok=False)
     backup = directory / "codex"
     shutil.copy2(binary, backup)
+    with backup.open('rb') as handle:
+        os.fsync(handle.fileno())
+    sync_directory(directory)
+    sync_directory(BACKUP_ROOT)
     return backup, sha256(backup)
 
 
 def status() -> None:
+    if (DATA_ROOT / 'transaction.json').exists():
+        print('Style: incomplete operation; run python3 scripts/maintain.py recover with the same runtime directory')
+        return
     binary = locate_codex_binary()
     version = codex_version(binary)
     current_sha = sha256(binary)

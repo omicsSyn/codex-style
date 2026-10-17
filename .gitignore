@@ -13,4 +13,5 @@ work/
 target/
 job.json
 backup.json
+transaction.json
 .DS_Store

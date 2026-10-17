@@ -34,8 +34,10 @@ markers, and other non-target styles keep their upstream behavior.
   enough disk space, memory, and time for a full Rust release build. This can be
   substantially more expensive than installing a prebuilt CLI package.
 
-The locator supports native Linux executables and the Linux x64/arm64 npm layouts
-recognized by the helper. Native Windows and macOS are not supported.
+The locator supports native Linux executables and Linux x64/arm64 npm platform
+packages in nested or ancestor `node_modules` directories, including sibling,
+hoisted, and symlinked packages. It also supports the older package-local
+`vendor` layout. Native Windows and macOS are not supported.
 Unknown shell wrappers are rejected, so repair cannot replace a launcher script.
 Stable versions must report exactly `codex-cli X.Y.Z`; prerelease/custom version strings
 are rejected instead of being silently mapped to a different official tag.
@@ -67,6 +69,7 @@ The bundled launcher also works directly:
 python3 scripts/codex-style status
 python3 scripts/codex-style repair
 python3 scripts/codex-style rollback
+python3 scripts/codex-style recover
 ```
 
 `apply` is an alias for `repair`. No global shell command, configuration change,
@@ -80,8 +83,11 @@ Repair snapshots the skill, helper, and tracked state, then fetches the official
 `rust-vX.Y.Z` tag matching the installed executable. It applies or narrowly adapts
 the renderer patch, runs formatting and the full Markdown rendering test module,
 builds a release binary, checks its version and startup, and replaces the installed
-executable only after verification. Installation failures trigger recovery of
-the prior executable, adapted patch, and state.
+executable only after verification. Before replacement, it saves a recovery
+journal containing the backup location, checksums, and original metadata.
+Caught exceptions trigger recovery of the prior executable, adapted patch,
+state, and job record. Forced process termination requires the `recover` command
+described below.
 
 Restart Codex CLI after a successful repair. A package-manager update can replace
 the custom executable; run `status`, then `repair` for the new version.
@@ -92,15 +98,50 @@ and refuses to overwrite an untracked update. If the CLI was already customized
 before its first recorded repair, its first backup is that existing image, not a
 verified official binary.
 
+## Recover after an interruption
+
+Starting with 1.1.1, installation and rollback persist a recovery journal before
+changing the executable. If the process receives `SIGTERM`, `SIGKILL`, or another
+abrupt termination, use the same runtime directory and run:
+
+```bash
+python3 scripts/maintain.py status
+python3 scripts/maintain.py recover
+```
+
+Pending recovery blocks a new install, repair, or rollback. `recover` checks the
+original backup and verifies that the installed executable is either the recorded
+original or target image. It restores the pre-operation executable and metadata,
+then removes the completed journal. It can itself be interrupted and retried.
+Temporary source files are not required; if the original job still exists, its
+previous record is restored too. After recovery, retry `install --work-dir
+/path/to/job` for a retained verified job, or start a new repair if the job expired.
+If a rollback was interrupted, recovery restores the customized executable that
+was present before that rollback; rerun `rollback` to finish the intended change.
+
+Recovery refuses a changed/corrupt backup or an unrelated executable update.
+Keep the journal and backups for diagnosis when it refuses. Do not edit recorded
+hashes to force recovery. This mechanism does not guarantee recovery from missing
+backups or filesystem/storage corruption, and it cannot reconstruct a journal
+for an interruption that happened under 1.1.0. Such older interruptions require
+inspected, checksum-verified manual restoration.
+
+Do not run maintenance against the same executable from different runtime
+directories, or concurrently with a package-manager update.
+
 ## Private runtime data
 
 Runtime state defaults to `~/.local/state/codex-style` (or
 `$XDG_STATE_HOME/codex-style`). Set `CODEX_STYLE_STATE_DIR` to use a different
 absolute directory outside this checkout. Use the same setting for every stage,
 status check, and rollback; separate installations need separate state directories.
+Each new job binds to its resolved runtime directory. Resuming with a different
+setting is rejected before mutation. Unfinished 1.1.0 jobs lack that binding and
+must be preserved rather than resumed by 1.1.1; create a fresh job. Existing
+completed 1.1.0 installation state and backups remain usable.
 
-This directory stores state records, adapted patches, source snapshots, and
-recovery binaries. Build jobs use a temporary directory that is retained on
+This directory stores state records, adapted patches, source snapshots, recovery
+binaries, and any pending `transaction.json` journal. Build jobs use a temporary directory that is retained on
 failure and printed for diagnosis. Jobs and snapshots contain local paths and
 may contain environment-specific build diagnostics. They are local operational
 data, not material to commit or attach wholesale to a public issue.
@@ -118,8 +159,10 @@ python3 scripts/maintain.py --help
 ```
 
 The offline regression suite checks adaptation, failure recovery, installation
-guards, rollback, and state isolation using temporary Git repositories and fake
-executables. It does **not** compile or replace the installed Codex CLI. Actual
+guards, rollback, state-directory binding, and npm layouts using temporary Git
+repositories and fake executables. It also kills isolated child processes during
+installation, rollback, and recovery to test the persistent journal. It does
+**not** compile or replace the installed Codex CLI. Actual
 `repair` requires the full Rust test/build checks before installation.
 
 For staged diagnosis and manual compatibility repairs, use [SKILL.md](SKILL.md).

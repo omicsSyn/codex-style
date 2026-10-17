@@ -2,6 +2,7 @@
 """Maintain version-matched Codex transcript colors with a bundled, portable helper."""
 
 import argparse
+import base64
 from contextlib import contextmanager
 from datetime import datetime
 import fcntl
@@ -49,14 +50,23 @@ def atomic_bytes(path, value, mode=None):
     fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as handle:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        if mode is not None:
-            os.chmod(temporary, mode)
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def save_job(work, job):
@@ -90,6 +100,102 @@ def helpers(tool):
     return module
 
 
+def transaction_path(m):
+    return m['DATA_ROOT'] / 'transaction.json'
+
+
+def require_no_transaction(m):
+    if transaction_path(m).exists():
+        raise RuntimeError('Incomplete operation; run python3 scripts/maintain.py recover with the same runtime directory')
+
+
+def bound_job(work):
+    job = load_job(work)
+    m = helpers(job['tool'])
+    if not job.get('runtime_root'):
+        raise RuntimeError('Job predates runtime-directory binding; preserve it and prepare a new job')
+    if job['runtime_root'] != str(m['DATA_ROOT']):
+        raise RuntimeError('Job runtime directory differs from the current environment; restore the original setting')
+    require_no_transaction(m)
+    return job
+
+
+def begin_transaction(m, operation, binary, version, backup, before_sha, after_sha, work=None):
+    """Persist everything needed to undo an interrupted mutation before it starts."""
+    require_no_transaction(m)
+    paths = [m['ACTIVE_PATCH_FILE'], m['state_path'](version)]
+    if work is not None:
+        paths.append(Path(work).resolve() / 'job.json')
+    saved = {}
+    for path in paths:
+        value = path.read_bytes() if path.exists() else None
+        saved[str(path)] = None if value is None else {
+            'data': base64.b64encode(value).decode('ascii'),
+            'sha256': hashlib.sha256(value).hexdigest(), 'mode': path.stat().st_mode & 0o777,
+        }
+    if digest(backup) != before_sha or digest(binary) != before_sha:
+        raise RuntimeError('Pre-operation image changed; refusing to create recovery journal')
+    record = {'schema': 1, 'operation': operation, 'runtime_root': str(m['DATA_ROOT']),
+              'binary': str(binary), 'version': version, 'backup': str(backup),
+              'before_sha256': before_sha, 'after_sha256': after_sha,
+              'work': str(Path(work).resolve()) if work is not None else None, 'files': saved}
+    atomic_bytes(transaction_path(m), (json.dumps(record, indent=2) + '\n').encode(), 0o600)
+
+
+def finish_transaction(m):
+    transaction_path(m).unlink()
+    sync_directory(m['DATA_ROOT'])
+
+
+def recover(tool):
+    """Restore the pre-operation image; remain retryable if recovery is interrupted."""
+    m = helpers(tool)
+    path = transaction_path(m)
+    if not path.exists():
+        return {'phase': 'no_recovery_needed', 'changed': False}
+    record = json.loads(path.read_text())
+    if (record.get('schema') != 1 or record.get('operation') not in ('install', 'rollback')
+            or record.get('runtime_root') != str(m['DATA_ROOT'])):
+        raise RuntimeError('Recovery journal does not match this runtime directory or schema')
+    binary = m['locate_codex_binary']()
+    version = record['version']
+    if str(binary) != record['binary']:
+        raise RuntimeError('Recovery binary path differs from the current installation')
+    backup = Path(record['backup'])
+    if (digest(backup) != record['before_sha256'] or m['codex_version'](backup) != version):
+        raise RuntimeError('Recovery backup is missing, changed, or has the wrong version')
+    if digest(binary) not in (record['before_sha256'], record['after_sha256']):
+        raise RuntimeError('Installed Codex changed outside this transaction; refusing recovery')
+    expected = {m['ACTIVE_PATCH_FILE'], m['state_path'](version)}
+    job_path = Path(record['work']) / 'job.json' if record.get('work') else None
+    if job_path is not None:
+        expected.add(job_path)
+    if set(record['files']) != {str(p) for p in expected}:
+        raise RuntimeError('Recovery metadata paths do not match the recorded operation')
+    # Decode and check all metadata before touching the executable.
+    saved = {}
+    for name, value in record['files'].items():
+        data = base64.b64decode(value['data'], validate=True) if value is not None else None
+        if value is not None and hashlib.sha256(data).hexdigest() != value['sha256']:
+            raise RuntimeError('Recovery metadata checksum mismatch')
+        saved[Path(name)] = None if data is None else (data, value['mode'])
+    if digest(binary) != record['before_sha256']:
+        m['install_binary'](backup, binary, version)
+    if digest(binary) != record['before_sha256']:
+        raise RuntimeError('Recovery binary checksum mismatch; preserve the journal and backups')
+    for target, value in saved.items():
+        if target == job_path and not target.parent.exists():
+            continue  # Temporary source jobs can expire; executable/state recovery still works.
+        if value is None:
+            target.unlink(missing_ok=True)
+            if target.parent.exists():
+                sync_directory(target.parent)
+        else:
+            atomic_bytes(target, *value)
+    finish_transaction(m)
+    return {'phase': 'recovered', 'operation': record['operation'], 'version': version}
+
+
 def active(m):
     binary = m['locate_codex_binary']()
     version = m['codex_version'](binary)
@@ -114,6 +220,8 @@ def snapshot(tool, purpose, root=None, skill=SKILL_ROOT):
         shutil.copytree(m['STATE_DIR'], target / 'runtime-state', symlinks=True)
     if m['ACTIVE_PATCH_FILE'].is_file():
         shutil.copy2(m['ACTIVE_PATCH_FILE'], target / 'active.patch')
+    if transaction_path(m).is_file():
+        shutil.copy2(transaction_path(m), target / 'transaction.json')
     hashes = {str(p.relative_to(target)): digest(p)
               for p in target.rglob('*') if p.is_file() and not p.is_symlink()}
     manifest = {'skill_version': label, 'created_at': datetime.now().astimezone().isoformat(),
@@ -146,6 +254,7 @@ def tool_lock(tool):
 
 def prepare(tool, work=None):
     m = helpers(tool)
+    require_no_transaction(m)
     m['ensure_tools']()
     binary = m['locate_codex_binary']()
     version = m['codex_version'](binary)
@@ -154,7 +263,7 @@ def prepare(tool, work=None):
     if any(work.iterdir()):
         if not (work / 'job.json').is_file():
             raise RuntimeError('Existing directory is not a maintenance job; preserve it and select a new directory')
-        job = load_job(work)
+        job = bound_job(work)
         if (job.get('phase') != 'preparing' or job.get('tool') != str(Path(tool).resolve())
                 or job.get('version') != version or job.get('binary') != str(binary)
                 or job.get('starting_sha256') != digest(binary)):
@@ -165,6 +274,7 @@ def prepare(tool, work=None):
     else:
         backup = snapshot(tool, f'Automatic color maintenance for Codex {version}')
         job = {'version': version, 'tool': str(Path(tool).resolve()),
+               'runtime_root': str(m['DATA_ROOT']),
                'binary': str(binary), 'starting_sha256': digest(binary),
                'snapshot': str(backup), 'phase': 'preparing'}
     save_job(work, job)
@@ -223,7 +333,7 @@ def rewrite_styles(text):
 
 def capture(work):
     work = Path(work)
-    job = load_job(work)
+    job = bound_job(work)
     source = work / 'source'
     validate_source(work)
     patch = command(['git', 'diff', 'HEAD', '--', *FILES], source).encode()
@@ -239,7 +349,7 @@ def capture(work):
 
 def adapt(work):
     work = Path(work)
-    job = load_job(work)
+    job = bound_job(work)
     source = work / 'source'
     validate_source(work)
     changed = source_changes(source)
@@ -288,7 +398,7 @@ def source_changes(source):
 
 def validate_source(work):
     work = Path(work)
-    job = load_job(work)
+    job = bound_job(work)
     source = work / 'source'
     if command(['git', 'rev-parse', 'HEAD'], source).strip() != job['source_commit']:
         raise RuntimeError('Source commit changed; prepare a new job')
@@ -320,7 +430,7 @@ def fingerprint(work):
 
 def verify(work):
     work = Path(work)
-    job = load_job(work)
+    job = bound_job(work)
     if job.get('phase') not in ('adapted', 'verified'):
         raise RuntimeError('Capture an adapted candidate before verification')
     job.pop('validation', None)
@@ -366,7 +476,7 @@ def verify(work):
 
 def install(work):
     work = Path(work)
-    job = load_job(work)
+    job = bound_job(work)
     validation = job.get('validation')
     if job.get('phase') != 'verified' or not validation:
         raise RuntimeError('Installation requires successful verification')
@@ -394,11 +504,10 @@ def install(work):
     if previous and rollback_sha != previous.get('backup_sha256'):
         raise RuntimeError('Rollback backup checksum mismatch')
     patch_path = m['ACTIVE_PATCH_FILE']
-    state_path = m['state_path'](version)
-    saved = {p: (p.read_bytes(), p.stat().st_mode) if p.exists() else None
-             for p in (patch_path, state_path)}
     if digest(binary) != job['starting_sha256'] or digest(preinstall) != preinstall_sha:
         raise RuntimeError('Pre-install image changed during backup')
+    begin_transaction(m, 'install', binary, version, preinstall, preinstall_sha,
+                      validation['binary_sha256'], work)
     try:
         m['install_binary'](candidate, binary, version)
         if digest(binary) != validation['binary_sha256']:
@@ -416,20 +525,14 @@ def install(work):
         m['write_state'](version, state)
         if not active(m):
             raise RuntimeError('Installed state does not report active colors')
+        job['phase'] = 'installed'
+        job.pop('failure', None)
+        job['recovery'] = {'tool': str(recovery), 'binary': str(preinstall)}
+        save_job(work, job)
     except BaseException:
-        m['install_binary'](preinstall, binary, version)
-        for path, value in saved.items():
-            if value is None:
-                path.unlink(missing_ok=True)
-            else:
-                atomic_bytes(path, *value)
-        if digest(binary) != preinstall_sha:
-            raise RuntimeError('Recovery checksum mismatch; preserve the backup and stop')
+        recover(job['tool'])
         raise
-    job['phase'] = 'installed'
-    job.pop('failure', None)
-    job['recovery'] = {'tool': str(recovery), 'binary': str(preinstall)}
-    save_job(work, job)
+    finish_transaction(m)
     return {'version': version, 'phase': 'installed', 'tests_passed': validation['tests_passed'],
             'skill_backup': job['snapshot'], 'work_dir': str(work)}
 
@@ -437,6 +540,7 @@ def install(work):
 def rollback(tool):
     """Restore only the tracked same-version image, preserving a recovery copy."""
     m = helpers(tool)
+    require_no_transaction(m)
     binary = m['locate_codex_binary']()
     version = m['codex_version'](binary)
     state = m['load_state'](version)
@@ -452,11 +556,9 @@ def rollback(tool):
     if current != state['custom_sha256']:
         raise RuntimeError('Installed Codex changed; refusing to overwrite an untracked update')
     recovery, recovery_sha = m['create_backup'](binary, version)
-    state_path = m['state_path'](version)
-    saved_state = state_path.read_bytes()
-    state_mode = state_path.stat().st_mode
     if digest(binary) != current or digest(recovery) != recovery_sha:
         raise RuntimeError('Installed Codex changed during rollback preparation')
+    begin_transaction(m, 'rollback', binary, version, recovery, recovery_sha, state['backup_sha256'])
     try:
         m['install_binary'](backup, binary, version)
         if digest(binary) != state['backup_sha256']:
@@ -467,17 +569,15 @@ def rollback(tool):
         state['pre_rollback_backup'] = str(recovery)
         m['write_state'](version, state)
     except BaseException:
-        m['install_binary'](recovery, binary, version)
-        atomic_bytes(state_path, saved_state, state_mode)
-        if digest(binary) != recovery_sha:
-            raise RuntimeError('Rollback recovery checksum mismatch; preserve backups and stop')
+        recover(tool)
         raise
+    finish_transaction(m)
     return {'version': version, 'phase': 'restored', 'recovery': str(recovery)}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('status', 'backup', 'repair', 'apply', 'rollback', 'prepare', 'adapt', 'capture', 'verify', 'install'))
+    parser.add_argument('action', choices=('status', 'backup', 'repair', 'apply', 'rollback', 'recover', 'prepare', 'adapt', 'capture', 'verify', 'install'))
     parser.add_argument('--tool-dir', type=Path, default=DEFAULT_TOOL)
     parser.add_argument('--work-dir', type=Path)
     parser.add_argument('--purpose', default='Before evidence-based maintenance changes')
@@ -487,6 +587,13 @@ def main():
         return
     os.umask(0o077)
     work = args.work_dir.resolve() if args.work_dir else None
+    if work and (work / 'job.json').exists():
+        job = load_job(work)
+        if Path(job['tool']) != args.tool_dir.resolve():
+            raise RuntimeError('Job tool directory does not match --tool-dir')
+        bound_job(work)  # Refuse a changed runtime root before creating directories or logging.
+    if args.action == 'recover' and work:
+        parser.error('recover uses the runtime journal; omit --work-dir')
     with tool_lock(args.tool_dir):
         try:
             if args.action == 'backup':
@@ -495,7 +602,10 @@ def main():
                 prepare(args.tool_dir, work)
             elif args.action == 'rollback':
                 print(json.dumps(rollback(args.tool_dir)))
+            elif args.action == 'recover':
+                print(json.dumps(recover(args.tool_dir)))
             elif args.action in ('repair', 'apply'):
+                require_no_transaction(helpers(args.tool_dir))
                 if active(helpers(args.tool_dir)):
                     print(json.dumps({'phase': 'already_active', 'changed': False}))
                     return
@@ -506,7 +616,7 @@ def main():
             elif not work:
                 parser.error('--work-dir is required to resume a job')
             else:
-                job = load_job(work)
+                job = bound_job(work)
                 if Path(job['tool']) != args.tool_dir.resolve():
                     raise RuntimeError('Job tool directory does not match --tool-dir')
                 result = {'adapt': adapt, 'capture': capture, 'verify': verify, 'install': install}[args.action](work)
@@ -514,8 +624,9 @@ def main():
         except BaseException as error:
             if work and (Path(work) / 'job.json').is_file():
                 job = load_job(work)
-                job['failure'] = {'stage': args.action, 'error': str(error)}
-                save_job(work, job)
+                if job.get('runtime_root') == str(helpers(args.tool_dir)['DATA_ROOT']):
+                    job['failure'] = {'stage': args.action, 'error': str(error)}
+                    save_job(work, job)
             raise
 
 

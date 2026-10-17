@@ -4,7 +4,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -71,6 +73,7 @@ class MaintenanceTests(unittest.TestCase):
         self.addCleanup(self.snapshot_patch.stop)
         snapshot = self.backup(self.tool, 'Simulated prepare')
         M.save_job(self.work, {'version': '0.159.2', 'tool': str(self.tool),
+                              'runtime_root': str(self.h['DATA_ROOT']),
                               'binary': str(self.binary), 'starting_sha256': M.digest(self.binary),
                               'source_commit': M.command(['git', 'rev-parse', 'HEAD'], self.source).strip(),
                               'snapshot': str(snapshot), 'phase': 'prepared'})
@@ -459,6 +462,252 @@ class MaintenanceTests(unittest.TestCase):
             M.prepare(self.tool, work)
         self.assertEqual((work / 'source/partial.txt').read_text(), 'Incomplete source retained\n')
         self.assert_original()
+
+    def interrupt_operation(self, action, stage='binary', signum=signal.SIGTERM):
+        """Kill only a forked fixture process; the live CLI is never used."""
+        pid = os.fork()
+        if pid == 0:
+            try:
+                if stage == 'binary':
+                    original = self.h['install_binary']
+
+                    def interrupted(*args):
+                        original(*args)
+                        os.kill(os.getpid(), signum)
+
+                    self.h['install_binary'] = interrupted
+                elif stage == 'state':
+                    original = self.h['write_state']
+
+                    def interrupted(*args):
+                        original(*args)
+                        os.kill(os.getpid(), signum)
+
+                    self.h['write_state'] = interrupted
+                else:
+                    original = M.save_job
+
+                    def interrupted(work, job):
+                        original(work, job)
+                        if job['phase'] == 'installed':
+                            os.kill(os.getpid(), signum)
+
+                    M.save_job = interrupted
+                action()
+            except BaseException:
+                os._exit(2)
+            os._exit(3)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFSIGNALED(status), f'Child did not reach interruption point: {status}')
+        self.assertEqual(os.WTERMSIG(status), signum)
+
+    def assert_install_recovery(self):
+        self.assertTrue(M.transaction_path(self.h).is_file())
+        self.assertEqual(M.recover(self.tool)['phase'], 'recovered')
+        self.assertFalse(M.transaction_path(self.h).exists())
+        self.assert_original()
+        self.assertEqual(M.load_job(self.work)['phase'], 'verified')
+        self.assertEqual(M.recover(self.tool)['phase'], 'no_recovery_needed')
+        self.assertEqual(M.install(self.work)['phase'], 'installed')
+        self.assertEqual(M.rollback(self.tool)['phase'], 'restored')
+        self.assertEqual(self.binary.read_bytes(), self.original_binary)
+
+    def test_sigterm_after_install_replacement_is_recoverable(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        self.assertNotEqual(self.binary.read_bytes(), self.original_binary)
+        with self.assertRaisesRegex(RuntimeError, 'Incomplete operation'):
+            M.install(self.work)
+        with self.assertRaisesRegex(RuntimeError, 'Incomplete operation'):
+            M.rollback(self.tool)
+        self.assert_install_recovery()
+
+    def test_sigkill_after_install_replacement_is_recoverable(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work), signum=signal.SIGKILL)
+        self.assert_install_recovery()
+
+    def test_public_cli_status_and_recover_handle_pending_transaction(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        journal = M.transaction_path(self.h).read_bytes()
+        custom = self.binary.read_bytes()
+        args = [sys.executable, '-B', str(M.SKILL_ROOT / 'scripts/maintain.py')]
+        result = subprocess.run(args + ['status', '--tool-dir', str(self.tool)],
+                                capture_output=True, text=True, check=True)
+        self.assertIn('incomplete operation', result.stdout)
+        self.assertEqual(M.transaction_path(self.h).read_bytes(), journal)
+        self.assertEqual(self.binary.read_bytes(), custom)
+        # Only this temporary helper locates the executable shell fixture.
+        with (self.tool / 'codex-style').open('a') as handle:
+            handle.write('\ndef locate_codex_binary():\n    return Path(' + repr(str(self.binary)) + ')\n')
+        result = subprocess.run(args + ['recover', '--tool-dir', str(self.tool)],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout)['phase'], 'recovered')
+        self.assert_original()
+        self.assertEqual(M.load_job(self.work)['phase'], 'verified')
+
+    def test_recovery_refuses_metadata_checksum_mismatch_before_mutation(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        path = M.transaction_path(self.h)
+        record = json.loads(path.read_text())
+        record['files'][str(self.work / 'job.json')]['sha256'] = '0' * 64
+        path.write_text(json.dumps(record))
+        custom = self.binary.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'metadata checksum mismatch'):
+            M.recover(self.tool)
+        self.assertEqual(self.binary.read_bytes(), custom)
+        self.assertTrue(path.exists())
+
+    def test_interruption_after_state_write_restores_metadata(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work), stage='state')
+        self.assertIsNotNone(self.h['load_state']('0.159.2'))
+        self.assert_install_recovery()
+
+    def test_interruption_after_job_write_restores_job(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work), stage='job')
+        self.assertEqual(M.load_job(self.work)['phase'], 'installed')
+        self.assert_install_recovery()
+
+    def test_interrupted_rollback_restores_custom_image_and_state(self):
+        self.verified()
+        M.install(self.work)
+        custom = self.binary.read_bytes()
+        state = self.h['state_path']('0.159.2').read_bytes()
+        self.interrupt_operation(lambda: M.rollback(self.tool))
+        self.assertEqual(self.binary.read_bytes(), self.original_binary)
+        self.assertEqual(M.recover(self.tool)['operation'], 'rollback')
+        self.assertEqual(self.binary.read_bytes(), custom)
+        self.assertEqual(self.h['state_path']('0.159.2').read_bytes(), state)
+        self.assertEqual(M.rollback(self.tool)['phase'], 'restored')
+
+    def test_recovery_can_itself_be_interrupted_and_retried(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        self.interrupt_operation(lambda: M.recover(self.tool))
+        self.assertEqual(self.binary.read_bytes(), self.original_binary)
+        self.assert_install_recovery()
+
+    def test_recovery_does_not_depend_on_temporary_source_job(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        shutil.rmtree(self.work)
+        self.assertEqual(M.recover(self.tool)['phase'], 'recovered')
+        self.assert_original()
+        self.assertFalse(self.work.exists())
+
+    def test_recovery_refuses_external_update(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        self.write_binary(self.binary, 'external update', '0.160.0')
+        updated = self.binary.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'changed outside this transaction'):
+            M.recover(self.tool)
+        self.assertEqual(self.binary.read_bytes(), updated)
+        self.assertTrue(M.transaction_path(self.h).exists())
+
+    def test_recovery_refuses_corrupted_backup(self):
+        self.verified()
+        self.interrupt_operation(lambda: M.install(self.work))
+        record = json.loads(M.transaction_path(self.h).read_text())
+        backup = Path(record['backup'])
+        backup.write_bytes(backup.read_bytes() + b'corruption')
+        before = self.binary.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'Recovery backup'):
+            M.recover(self.tool)
+        self.assertEqual(self.binary.read_bytes(), before)
+        self.assertTrue(M.transaction_path(self.h).exists())
+
+    def test_journal_write_failure_prevents_binary_replacement(self):
+        self.verified()
+        original = M.atomic_bytes
+
+        def fail(path, *args):
+            if Path(path) == M.transaction_path(self.h):
+                raise OSError('Injected journal write failure')
+            return original(path, *args)
+
+        with patch.object(M, 'atomic_bytes', side_effect=fail):
+            with self.assertRaisesRegex(OSError, 'journal write failure'):
+                M.install(self.work)
+        self.assert_original()
+        self.assertFalse(M.transaction_path(self.h).exists())
+
+    def test_every_resume_stage_rejects_a_changed_runtime_directory(self):
+        self.verified()
+        job_before = (self.work / 'job.json').read_bytes()
+        alternate = self.root / 'other-runtime'
+        with patch.dict(os.environ, {'CODEX_STYLE_STATE_DIR': str(alternate)}):
+            other = runpy.run_path(str(self.tool / 'codex-style'), run_name='alternate_helpers')
+        with patch.object(M, 'helpers', return_value=other):
+            for stage in (M.adapt, M.capture, M.verify, M.install):
+                with self.subTest(stage=stage.__name__):
+                    with self.assertRaisesRegex(RuntimeError, 'runtime directory differs'):
+                        stage(self.work)
+        self.assertFalse(alternate.exists())
+        self.assertEqual((self.work / 'job.json').read_bytes(), job_before)
+        self.assert_original()
+
+    def test_cli_refuses_changed_runtime_before_creating_directory(self):
+        self.verified()
+        alternate = self.root / 'other-runtime'
+        environment = os.environ.copy()
+        environment['CODEX_STYLE_STATE_DIR'] = str(alternate)
+        job_before = (self.work / 'job.json').read_bytes()
+        result = subprocess.run([sys.executable, '-B', str(M.SKILL_ROOT / 'scripts/maintain.py'),
+                                 'install', '--tool-dir', str(self.tool), '--work-dir', str(self.work)],
+                                env=environment, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('runtime directory differs', result.stderr)
+        self.assertFalse(alternate.exists())
+        self.assertEqual((self.work / 'job.json').read_bytes(), job_before)
+        self.assert_original()
+
+    def test_legacy_unbound_job_is_preserved_and_rejected(self):
+        job = M.load_job(self.work)
+        job.pop('runtime_root')
+        M.save_job(self.work, job)
+        before = (self.work / 'job.json').read_bytes()
+        with self.assertRaisesRegex(RuntimeError, 'predates runtime-directory binding'):
+            M.adapt(self.work)
+        self.assertEqual((self.work / 'job.json').read_bytes(), before)
+        self.assert_original()
+
+    def test_npm_sibling_hoisted_and_symlinked_platform_packages(self):
+        top = self.root / 'npm'
+        launcher = top / 'node_modules/@openai/codex/bin/codex.js'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('// launcher fixture\n')
+        platform_package = top / 'node_modules/@openai/codex-linux-x64'
+        native = platform_package / 'vendor/x86_64-unknown-linux-musl/bin/codex'
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b'\x7fELFfixture')
+        with patch.object(shutil, 'which', return_value=str(launcher)), patch('platform.machine', return_value='x86_64'):
+            self.assertEqual(self.locate_binary(), native)
+        deep = top / 'app/node_modules/@openai/codex/bin/codex.js'
+        deep.parent.mkdir(parents=True)
+        deep.write_text('// hoisted dependency fixture\n')
+        with patch.object(shutil, 'which', return_value=str(deep)), patch('platform.machine', return_value='x86_64'):
+            self.assertEqual(self.locate_binary(), native)
+        stored = top / 'store/platform'
+        stored.parent.mkdir()
+        platform_package.rename(stored)
+        platform_package.symlink_to(stored, target_is_directory=True)
+        with patch.object(shutil, 'which', return_value=str(launcher)), patch('platform.machine', return_value='x86_64'):
+            self.assertEqual(self.locate_binary(), stored / native.relative_to(platform_package))
+
+    def test_npm_sibling_wrapper_is_still_rejected(self):
+        launcher = self.root / 'node_modules/@openai/codex/bin/codex.js'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('// launcher fixture\n')
+        native = self.root / 'node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex'
+        self.write_binary(native, 'wrapper')
+        with patch.object(shutil, 'which', return_value=str(launcher)), patch('platform.machine', return_value='x86_64'):
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported Codex launcher'):
+                self.locate_binary()
 
 
 if __name__ == '__main__':
