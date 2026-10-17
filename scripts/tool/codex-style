@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parent
+PATCH_FILE = ROOT / "heading-colors.patch"
+DATA_ROOT = Path(
+    os.environ.get("CODEX_STYLE_STATE_DIR")
+    or str(Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "codex-style")
+).expanduser().resolve()
+STATE_DIR = DATA_ROOT / "state"
+BACKUP_ROOT = DATA_ROOT / "binaries"
+ACTIVE_PATCH_FILE = DATA_ROOT / "heading-colors.patch"
+REPOSITORY = "https://github.com/openai/codex.git"
+VERSION_RE = re.compile(r"codex-cli\s+(\d+\.\d+\.\d+)")
+
+PALETTE = {
+    "H1": "light red + bold + underline",
+    "H2": "magenta + bold",
+    "H3": "yellow + bold + italic",
+    "H4": "cyan + bold + italic",
+    "H5": "blue + bold + italic",
+    "H6": "light cyan + bold + italic",
+    "Strong": "muted warm orange #D19A66 + bold",
+}
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def patch_path() -> Path:
+    return ACTIVE_PATCH_FILE if ACTIVE_PATCH_FILE.is_file() else PATCH_FILE
+
+
+def require_native_binary(path: Path) -> Path:
+    with path.open('rb') as handle:
+        if handle.read(4) != b'\x7fELF':
+            raise RuntimeError('Unsupported Codex launcher; expected a native ELF executable or supported npm layout')
+    return path
+
+
+def locate_codex_binary() -> Path:
+    if platform.system() != "Linux":
+        raise RuntimeError("Supported platforms: Linux and WSL only.")
+    command = shutil.which("codex")
+    if not command:
+        raise RuntimeError("The codex command is not on PATH.")
+
+    entrypoint = Path(command).resolve()
+    if entrypoint.suffix != ".js":
+        return require_native_binary(entrypoint)
+
+    package_root = entrypoint.parent.parent
+    targets = {
+        ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+    }
+    target = targets.get((platform.system(), platform.machine()))
+    if not target:
+        raise RuntimeError(
+            f"Unsupported platform: {platform.system()} {platform.machine()}"
+        )
+
+    package_name, triple = target
+    candidates = [
+        package_root
+        / "node_modules"
+        / "@openai"
+        / package_name
+        / "vendor"
+        / triple
+        / "bin"
+        / "codex",
+        package_root / "vendor" / triple / "bin" / "codex",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return require_native_binary(candidate.resolve())
+    raise RuntimeError("Cannot locate the native Codex binary.")
+
+
+def codex_version(binary: Path) -> str:
+    result = subprocess.run(
+        [str(binary), "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    match = VERSION_RE.fullmatch(result.stdout.strip())
+    if not match:
+        raise RuntimeError(f"Cannot parse Codex version: {result.stdout.strip()}")
+    return match.group(1)
+
+
+def state_path(version: str) -> Path:
+    return STATE_DIR / f"{version}.json"
+
+
+def load_state(version: str) -> dict | None:
+    path = state_path(version)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_state(version: str, state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = state_path(version)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def install_binary(candidate: Path, destination: Path, expected_version: str) -> None:
+    temporary = destination.with_name(".codex-style.installing")
+    try:
+        shutil.copy2(candidate, temporary)
+        temporary.chmod(0o755)
+        if codex_version(temporary) != expected_version:
+            raise RuntimeError("Candidate and installed Codex versions differ.")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def ensure_tools() -> None:
+    missing = [
+        command
+        for command in ("git", "cargo", "just", "cargo-nextest", "strip")
+        if shutil.which(command) is None
+    ]
+    if missing:
+        raise RuntimeError("Missing build tools: " + ", ".join(missing))
+
+
+def create_backup(binary: Path, version: str) -> tuple[Path, str]:
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    directory = BACKUP_ROOT / f"{version}_before_heading_colors_{timestamp}"
+    directory.mkdir(parents=True, exist_ok=False)
+    backup = directory / "codex"
+    shutil.copy2(binary, backup)
+    return backup, sha256(backup)
+
+
+def status() -> None:
+    binary = locate_codex_binary()
+    version = codex_version(binary)
+    current_sha = sha256(binary)
+    current_patch_sha = sha256(patch_path())
+    state = load_state(version)
+
+    print(f"Codex: {version}")
+    print(f"Binary: {binary}")
+    if not state:
+        print("Style: untracked")
+    elif (
+        current_sha == state.get("custom_sha256")
+        and current_patch_sha == state.get("patch_sha256")
+    ):
+        print("Style: custom transcript colors active")
+    elif current_sha == state.get("custom_sha256"):
+        print("Style: definition changed; run codex-style apply")
+    elif current_sha == state.get("backup_sha256"):
+        print("Style: restored renderer")
+    else:
+        print("Style: changed or overwritten; run codex-style apply")
+
+    print("Palette:")
+    for heading, style in PALETTE.items():
+        print(f"  {heading}: {style}")

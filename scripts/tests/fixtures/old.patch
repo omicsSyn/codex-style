@@ -1,0 +1,136 @@
+diff --git a/codex-rs/tui/src/markdown_render.rs b/codex-rs/tui/src/markdown_render.rs
+index bea1e29..44360c6 100644
+--- a/codex-rs/tui/src/markdown_render.rs
++++ b/codex-rs/tui/src/markdown_render.rs
+@@ -65,6 +65,7 @@ use pulldown_cmark::Options;
+ use pulldown_cmark::Parser;
+ use pulldown_cmark::Tag;
+ use pulldown_cmark::TagEnd;
++use ratatui::style::Color;
+ use ratatui::style::Style;
+ use ratatui::text::Line;
+ use ratatui::text::Span;
+@@ -129,12 +130,12 @@ impl Default for MarkdownStyles {
+ impl MarkdownStyles {
+     fn for_theme(theme: &syntect::highlighting::Theme) -> Self {
+         Self {
+-            h1: Style::new().bold().underlined(),
+-            h2: Style::new().bold(),
+-            h3: Style::new().bold().italic(),
+-            h4: Style::new().italic(),
+-            h5: Style::new().italic(),
+-            h6: Style::new().italic(),
++            h1: Style::new().light_red().bold().underlined(),
++            h2: Style::new().magenta().bold(),
++            h3: Style::new().yellow().bold().italic(),
++            h4: Style::new().cyan().bold().italic(),
++            h5: Style::new().blue().bold().italic(),
++            h6: Style::new().light_cyan().bold().italic(),
+             code: foreground_style_for_scopes_with_theme(
+                 theme,
+                 &[
+@@ -144,7 +145,7 @@ impl MarkdownStyles {
+             )
+             .unwrap_or_else(|| Style::new().fg(accent_color())),
+             emphasis: Style::new().italic(),
+-            strong: Style::new().bold(),
++            strong: Style::new().fg(Color::Rgb(209, 154, 102)).bold(),
+             strikethrough: Style::new().crossed_out(),
+             ordered_list_marker: Style::new().fg(accent_color()),
+             unordered_list_marker: Style::new(),
+diff --git a/codex-rs/tui/src/markdown_render_tests.rs b/codex-rs/tui/src/markdown_render_tests.rs
+index 003e63d..c6a8f48 100644
+--- a/codex-rs/tui/src/markdown_render_tests.rs
++++ b/codex-rs/tui/src/markdown_render_tests.rs
+@@ -1,6 +1,7 @@
+ use super::MarkdownStyles;
+ use crate::style::accent_color;
+ use pretty_assertions::assert_eq;
++use ratatui::style::Color;
+ use ratatui::style::Modifier;
+ use ratatui::style::Stylize;
+ use ratatui::text::Line;
+@@ -149,17 +150,32 @@ fn headings() {
+     let md = "# Heading 1\n## Heading 2\n### Heading 3\n#### Heading 4\n##### Heading 5\n###### Heading 6\n";
+     let text = render_markdown_text(md);
+     let expected = Text::from_iter([
+-        Line::from_iter(["# ".bold().underlined(), "Heading 1".bold().underlined()]),
++        Line::from_iter([
++            "# ".light_red().bold().underlined(),
++            "Heading 1".light_red().bold().underlined(),
++        ]),
+         Line::default(),
+-        Line::from_iter(["## ".bold(), "Heading 2".bold()]),
++        Line::from_iter(["## ".magenta().bold(), "Heading 2".magenta().bold()]),
+         Line::default(),
+-        Line::from_iter(["### ".bold().italic(), "Heading 3".bold().italic()]),
++        Line::from_iter([
++            "### ".yellow().bold().italic(),
++            "Heading 3".yellow().bold().italic(),
++        ]),
+         Line::default(),
+-        Line::from_iter(["#### ".italic(), "Heading 4".italic()]),
++        Line::from_iter([
++            "#### ".cyan().bold().italic(),
++            "Heading 4".cyan().bold().italic(),
++        ]),
+         Line::default(),
+-        Line::from_iter(["##### ".italic(), "Heading 5".italic()]),
++        Line::from_iter([
++            "##### ".blue().bold().italic(),
++            "Heading 5".blue().bold().italic(),
++        ]),
+         Line::default(),
+-        Line::from_iter(["###### ".italic(), "Heading 6".italic()]),
++        Line::from_iter([
++            "###### ".light_cyan().bold().italic(),
++            "Heading 6".light_cyan().bold().italic(),
++        ]),
+     ]);
+     assert_eq!(text, expected);
+ }
+@@ -476,8 +492,8 @@ fn blockquote_heading_inherits_heading_style() {
+         [
+             Line::from_iter([
+                 "> ".into(),
+-                "# ".bold().underlined(),
+-                "test header".bold().underlined(),
++                "# ".light_red().bold().underlined(),
++                "test header".light_red().bold().underlined(),
+             ])
+             .green(),
+             Line::from_iter(["> "]).green(),
+@@ -788,7 +804,9 @@ fn inline_code_and_file_paths_follow_syntax_theme() {
+ fn strong() {
+     assert_eq!(
+         render_markdown_text("**Strong**"),
+-        Text::from(Line::from("Strong".bold()))
++        Text::from(Line::from(
++            "Strong".fg(Color::Rgb(209, 154, 102)).bold(),
++        ))
+     );
+ }
+ 
+@@ -812,8 +830,11 @@ fn strikethrough() {
+ fn strong_emphasis() {
+     let text = render_markdown_text("**Strong *emphasis***");
+     let expected = Text::from(Line::from_iter([
+-        "Strong ".bold(),
+-        "emphasis".bold().italic(),
++        "Strong ".fg(Color::Rgb(209, 154, 102)).bold(),
++        "emphasis"
++            .fg(Color::Rgb(209, 154, 102))
++            .bold()
++            .italic(),
+     ]));
+     assert_eq!(text, expected);
+ }
+@@ -1159,7 +1180,7 @@ fn multiline_file_link_label_after_styled_prefix_does_not_panic() {
+         Path::new("/Users/example/code/codex"),
+     );
+     let expected = Text::from(Line::from_iter([
+-        "bold".bold(),
++        "bold".fg(Color::Rgb(209, 154, 102)).bold(),
+         " plain ".into(),
+         "foo".into(),
+         " ".into(),

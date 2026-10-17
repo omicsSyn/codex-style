@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+state/
+runtime-state/
+snapshots/
+backups/
+binaries/
+work/
+target/
+job.json
+backup.json
+.DS_Store

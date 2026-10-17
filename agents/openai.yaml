@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Style"
+  short_description: "Maintain Codex CLI colors with verified builds and rollback"
+  default_prompt: "Use $codex-style to check my Codex CLI colors and restore them if an update replaced the custom renderer."
