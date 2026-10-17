@@ -240,13 +240,15 @@ def check_snapshot(target):
 
 
 @contextmanager
-def tool_lock(tool):
+def tool_lock(tool, wait=False, name='maintenance'):
     root = helpers(tool)['DATA_ROOT']
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = root / 'maintenance.lock'
+    if name not in ('maintenance', 'automatic-trigger'):
+        raise ValueError('Unsupported lock name')
+    path = root / (name + '.lock')
     with path.open('a') as handle:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as error:
             raise RuntimeError('Another codex-style maintenance operation is running') from error
         yield
@@ -581,6 +583,7 @@ def main():
     parser.add_argument('--tool-dir', type=Path, default=DEFAULT_TOOL)
     parser.add_argument('--work-dir', type=Path)
     parser.add_argument('--purpose', default='Before evidence-based maintenance changes')
+    parser.add_argument('--wait-lock', action='store_true', help='Wait for scheduled updates or another repair')
     args = parser.parse_args()
     if args.action == 'status':
         helpers(args.tool_dir)['status']()
@@ -594,7 +597,7 @@ def main():
         bound_job(work)  # Refuse a changed runtime root before creating directories or logging.
     if args.action == 'recover' and work:
         parser.error('recover uses the runtime journal; omit --work-dir')
-    with tool_lock(args.tool_dir):
+    with tool_lock(args.tool_dir, wait=args.wait_lock):
         try:
             if args.action == 'backup':
                 print(json.dumps({'backup': str(snapshot(args.tool_dir, args.purpose))}))

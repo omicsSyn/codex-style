@@ -27,3 +27,7 @@ jobs:
         run: |
           python3 -B scripts/maintain.py --help
           python3 -B scripts/codex-style --help
+          python3 -B scripts/automation.py --help
+          python3 -B scripts/auto.py --help
+          python3 -B scripts/watch.py --help
+          python3 -B scripts/update.py --help

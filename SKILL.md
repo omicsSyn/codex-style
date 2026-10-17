@@ -1,9 +1,9 @@
 ---
 name: codex-style
-description: Maintain custom heading and emphasis colors in Codex CLI on Linux or WSL. Use for checking color status, restoring colors after an update, or adapting a version-matched renderer patch with backups, tests, and rollback.
+description: Maintain custom heading and emphasis colors in Codex CLI on Linux or WSL. Check status, restore colors after updates, adapt a version-matched renderer with backups and tests, or explicitly configure event-driven repair and scheduled stable npm updates.
 license: Apache-2.0
 metadata:
-  version: "1.1.1"
+  version: "1.2.0"
 ---
 
 # Codex CLI color maintenance
@@ -19,6 +19,12 @@ maintain colors authorizes the necessary backups, candidate adaptation, tests,
 build, and same-version installation. Do not infer that authorization from a
 request for an explanation or audit. Explain that repair compiles Codex and
 replaces its installed executable; a restart is needed to load the new program.
+
+Automatic watching and scheduled upgrades are separate opt-in actions. A request
+to repair colors alone does not authorize creating services or upgrading Codex.
+When the user requests automation, use the setup below after confirming the
+installation, runtime directory, and requested schedule. Do not carry consent
+from another user or machine into this installation.
 
 Do not downgrade Codex, substitute a binary from another version, install missing
 system dependencies automatically, change proxy settings, or edit the user's
@@ -56,8 +62,51 @@ runtime directory before attempting another repair or rollback. Recovery restore
 the pre-operation image and metadata, not the unfinished target image. It checks
 the backup and current executable and refuses an unrelated external update.
 Keep the journal and backups if recovery cannot complete. Do not run maintenance
-concurrently with a package-manager update or from another runtime directory
-against the same executable.
+from another runtime directory against the same executable. The optional
+scheduled updater uses the maintenance lock; unrelated package-manager updates
+must not run concurrently with repair.
+
+## Optional event watching and daily updates
+
+Use `scripts/automation.py install` only when the user authorizes background
+color repair. Add `--daily-update` only when the user also authorizes upgrading
+Codex. The installer generates private configuration and user-level systemd
+units for the current installation. It refuses to overwrite differing existing
+files. Preserve and inspect any earlier units before replacing them.
+
+```bash
+# Event watching only; this may start a repair if colors are not active.
+python3 scripts/automation.py install
+# Watching plus automatic stable npm updates at the explicitly selected time.
+python3 scripts/automation.py install --daily-update \
+  --calendar '*-*-* 08:00:00 Asia/Shanghai'
+```
+
+The default daily schedule without `--calendar` is 08:00 system local time.
+Use the user's timezone when one is specified. Persistent timers catch up after
+downtime, but do not wake a stopped machine or WSL. The tool does not enable
+user lingering or restart existing Codex sessions.
+
+The watcher uses filesystem events and keeps receiving them while repair runs.
+It waits for a stable installation before calling `maintain.py repair
+--wait-lock`. Active colors and explicit same-version rollbacks do not rebuild.
+One failed/interrupted attempt for an unchanged installation requires diagnosis
+before `auto.py --retry`; future installation changes are still watched.
+Unknown renderer changes require assistant inspection, not blind repeated builds.
+
+The scheduled updater supports standard global npm installs only. It checks
+the official stable tag, skips same/older versions, saves verified package and
+native-executable backups, and installs the exact newer version into the checked
+prefix. It shares the maintenance lock with repair. Pending recovery journals
+block both workflows. A completed npm upgrade is not proof that color repair
+has completed; check the two status records separately.
+
+Setup captures PATH and the resolved private runtime root. `--inherit-proxy`
+copies only proxy/certificate environment values, not API credentials. Never
+publish generated units, environment files, runtime records, logs, or backups.
+Read [README.md](README.md#optional-automatic-maintenance-120) for operation,
+disabling, status commands, and private runtime locations. Validate with offline
+tests and isolated event tests; do not update the live CLI merely to test setup.
 
 Unknown renderer semantics must stop automatic adaptation. Inspect the actual
 version's source and test failures before changing a candidate. Limit changes

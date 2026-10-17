@@ -77,6 +77,82 @@ dependency installation, or background updater is created automatically. The
 tool does not edit your global `AGENTS.md` or ask the assistant to change its
 writing style.
 
+## Optional automatic maintenance (1.2.0)
+
+Automation is **opt-in**. It requires a working user-level systemd manager and
+Linux `inotify`/`pidfd_open` support, in addition to the repair requirements above.
+Keep the checkout at its installed location: services run its Python scripts.
+
+To restore colors automatically after changes to the current Codex installation:
+
+```bash
+python3 scripts/automation.py install
+```
+
+This enables `codex-style-auto.service`. It listens for filesystem events rather
+than periodically polling. After an event, it waits for the installation to stay
+stable for 10 seconds, then checks the binary and patch hashes. Active colors
+skip the build; overwritten colors invoke the existing verified repair pipeline.
+The watcher keeps receiving events during a build, including whole-package
+replacement and same-version reinstallation. An explicit rollback is preserved
+for that version. Failed or interrupted attempts are recorded without endlessly
+rebuilding the same installation.
+
+To also authorize a daily stable npm update at **08:00 Beijing time**:
+
+```bash
+python3 scripts/automation.py install --daily-update \
+  --calendar '*-*-* 08:00:00 Asia/Shanghai'
+```
+
+Without `--calendar`, the daily check defaults to 08:00 in the system's local
+timezone. Scheduled upgrades support a standard, writable global npm installation;
+native executable installs can use watching, but not this npm updater. Prefix
+discovery rejects an unfamiliar layout. The updater checks npm's official
+`latest` tag, skips equal or older versions, backs up the current package (and
+any hoisted native executable), installs the exact newer stable version, then
+checks its version and startup. It never automatically downgrades or installs a
+prerelease. Updating and color repair use the same maintenance lock.
+
+The timer uses `Persistent=true`: if the machine or WSL was stopped at the
+scheduled time, it catches up when the user services next start. It does not wake
+a powered-off machine or keep WSL running. Existing Codex sessions are not
+restarted; start a new session after repair to load the customized executable.
+
+Service configuration records the current command paths and private runtime root.
+Rerun setup after moving the checkout or installation, but preserve and inspect
+existing configuration first: setup refuses to overwrite differing files.
+It does not change your login/linger policy. If downloads need the current proxy,
+add `--inherit-proxy`; only proxy/certificate variables are copied to a private
+environment file. API keys and authentication files are not copied.
+
+```bash
+systemctl --user status codex-style-auto.service
+systemctl --user list-timers codex-update.timer --all
+journalctl --user -u codex-update.service -u codex-style-auto.service -n 40
+python3 scripts/update.py --check-only
+```
+
+Use the same `CODEX_STYLE_STATE_DIR` for manual checks as for setup. Automation
+records `state/auto.json`, `state/auto.log`, `state/update.json`, and
+`state/update.log` beneath that private runtime root. Package backups are kept
+in `npm-backups/`; none are automatically deleted. A successful npm upgrade is
+recorded separately from successful color repair. An unknown renderer layout
+still requires diagnosis and adaptation; automation does not launch an AI agent.
+Pending recovery journals block both automatic repair and scheduled upgrades.
+After diagnosing a failed automatic attempt, resume its job or explicitly retry:
+
+```bash
+python3 scripts/auto.py --retry
+```
+
+To disable scheduled upgrades, run `systemctl --user disable --now
+codex-update.timer`. To disable watching too, run `systemctl --user disable --now
+codex-style-auto.service`. Stop automation when it is idle: stopping the watcher
+also terminates its running repair subprocess. Disabling a timer does not cancel
+an update service that has already started. Runtime state, configuration, and
+backups are preserved.
+
 ## What repair changes
 
 Repair snapshots the skill, helper, and tracked state, then fetches the official
@@ -127,7 +203,8 @@ for an interruption that happened under 1.1.0. Such older interruptions require
 inspected, checksum-verified manual restoration.
 
 Do not run maintenance against the same executable from different runtime
-directories, or concurrently with a package-manager update.
+directories. The opt-in scheduled updater coordinates through the same lock;
+other package-manager updates must not run concurrently with maintenance.
 
 ## Private runtime data
 
@@ -160,10 +237,18 @@ python3 scripts/maintain.py --help
 
 The offline regression suite checks adaptation, failure recovery, installation
 guards, rollback, state-directory binding, and npm layouts using temporary Git
-repositories and fake executables. It also kills isolated child processes during
+repositories and fake executables. Automation checks cover version selection,
+private runtime state, optional service generation, and update/repair exclusion.
+It also kills isolated child processes during
 installation, rollback, and recovery to test the persistent journal. It does
 **not** compile or replace the installed Codex CLI. Actual
 `repair` requires the full Rust test/build checks before installation.
+
+On a Linux/WSL host with a working user systemd manager, also run
+`python3 -B scripts/tests/check_watch.py` for isolated filesystem-event tests.
+It temporarily creates a uniquely named test service, uses a fake CLI and fake
+repair, removes the test service afterward, and preserves temporary diagnostic
+logs. It never changes the installed CLI or production automation units.
 
 For staged diagnosis and manual compatibility repairs, use [SKILL.md](SKILL.md).
 Do not remove failing tests or relax verification to force an installation.
