@@ -1,6 +1,7 @@
 """Offline updater decisions and cross-process update/repair exclusion."""
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -128,14 +129,17 @@ class UpdateTests(unittest.TestCase):
         self.assertIn('--fetch-retries=3', command)
 
     def test_platform_helper_check_matches_vendor_layout(self):
-        helper = U.platform_helper_dir(self.prefix)
-        if helper is None:
+        roots = U.platform_helper_roots(self.prefix)
+        if not roots:
             self.skipTest('platform mapping not covered on this machine')
         self.assertFalse(U.platform_helper_ok(self.prefix))
-        binary = helper / 'vendor' / 'test-triple' / 'bin' / 'codex'
-        binary.parent.mkdir(parents=True)
-        binary.write_text('fixture')
-        self.assertTrue(U.platform_helper_ok(self.prefix))
+        for root in roots:
+            with self.subTest(root=root):
+                binary = root / 'vendor' / 'test-triple' / 'bin' / 'codex'
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_text('fixture')
+                self.assertTrue(U.platform_helper_ok(self.prefix))
+                shutil.rmtree(root / 'vendor')
 
     def test_pending_recovery_prevents_package_update(self):
         self.runtime.mkdir()
@@ -174,21 +178,21 @@ class InstallTests(unittest.TestCase):
 
     def test_install_retries_once_when_helper_is_missing(self):
         run, helper = self.run_install([False, True])
-        U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+        U.install(self.prefix, '0.10.0', io.StringIO())
         self.assertEqual(run.call_count, 2)
         self.assertEqual(helper.call_count, 2)
 
     def test_install_fails_when_helper_stays_missing(self):
         run, helper = self.run_install([False, False])
         with self.assertRaises(RuntimeError):
-            U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+            U.install(self.prefix, '0.10.0', io.StringIO())
         self.assertEqual(run.call_count, 2)
         self.assertEqual(helper.call_count, 2)
 
     def test_install_fails_without_helper_check_when_npm_fails(self):
         run, helper = self.run_install([True], npm_returncode=1)
         with self.assertRaises(RuntimeError):
-            U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+            U.install(self.prefix, '0.10.0', io.StringIO())
         run.assert_called_once()
         helper.assert_not_called()
 

@@ -69,22 +69,38 @@ def npm_command(prefix, *args):
             '--update-notifier=false']
 
 
-def platform_helper_dir(prefix):
-    """Expected @openai/codex-<platform> helper package for this machine."""
+def platform_helper_name():
+    """Expected @openai/codex-<platform> helper package name for this machine."""
     os_name = {'linux': 'linux', 'darwin': 'darwin', 'windows': 'win32'}.get(platform.system().lower())
     arch = {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine().lower())
     if not os_name or not arch:
         return None
-    return prefix / 'lib/node_modules/@openai/codex/node_modules/@openai' / f'codex-{os_name}-{arch}'
+    return f'codex-{os_name}-{arch}'
+
+
+def platform_helper_roots(prefix):
+    """Package roots that may hold the vendor binary, mirroring the locator.
+
+    Covers the package-local vendor layout, the nested helper package, and a
+    hoisted sibling helper package; symlinked layouts resolve through them.
+    """
+    name = platform_helper_name()
+    if name is None:
+        return []
+    package = prefix / 'lib/node_modules/@openai/codex'
+    return [package, package / 'node_modules/@openai' / name, package.parent / name]
 
 
 def platform_helper_ok(prefix):
-    """True when the platform helper package with its vendor binary is present."""
-    helper = platform_helper_dir(prefix)
-    if helper is None:
+    """True when a vendor binary for this platform is present somewhere expected."""
+    roots = platform_helper_roots(prefix)
+    if not roots:
         return True  # unknown platform: rely on the installed() verification instead
-    vendor = helper / 'vendor'
-    return vendor.is_dir() and any(vendor.glob('*/bin/codex*'))
+    for root in roots:
+        vendor = root / 'vendor'
+        if vendor.is_dir() and any(vendor.glob('*/bin/codex*')):
+            return True
+    return False
 
 
 def latest(prefix, log):
