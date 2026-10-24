@@ -117,6 +117,26 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(command[1], '/fixture/npm-cli.js')
         self.assertIn('--registry=https://registry.npmjs.org', command)
 
+    def test_npm_command_has_no_fragile_fetch_limits(self):
+        # A short fetch timeout plus a single retry once silently dropped the
+        # large platform helper tarball: npm reports optional-dependency fetch
+        # failures as non-fatal, so the install "succeeded" without a binary.
+        with patch.object(U.shutil, 'which', side_effect=lambda n: '/fixture/node' if n == 'node' else '/fixture/npm-cli.js'):
+            command = U.npm_command(self.prefix, 'install')
+        self.assertNotIn('--fetch-retries=1', command)
+        self.assertFalse(any('--fetch-timeout' in part for part in command))
+        self.assertIn('--fetch-retries=3', command)
+
+    def test_platform_helper_check_matches_vendor_layout(self):
+        helper = U.platform_helper_dir(self.prefix)
+        if helper is None:
+            self.skipTest('platform mapping not covered on this machine')
+        self.assertFalse(U.platform_helper_ok(self.prefix))
+        binary = helper / 'vendor' / 'test-triple' / 'bin' / 'codex'
+        binary.parent.mkdir(parents=True)
+        binary.write_text('fixture')
+        self.assertTrue(U.platform_helper_ok(self.prefix))
+
     def test_pending_recovery_prevents_package_update(self):
         self.runtime.mkdir()
         (self.runtime / 'transaction.json').write_text('{}')
@@ -128,6 +148,49 @@ class UpdateTests(unittest.TestCase):
         entry = self.prefix / 'lib/node_modules/@openai/codex/bin/codex.js'
         with patch.object(U.shutil, 'which', return_value=str(entry)):
             self.assertEqual(U.discover_prefix(), self.prefix)
+
+
+class InstallTests(unittest.TestCase):
+    """Real install() behavior: npm failure handling and helper-package verification."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='codex-install-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.prefix = Path(self.temp.name) / 'node'
+        self.prefix.mkdir()
+        which = patch.object(U.shutil, 'which',
+                             side_effect=lambda n: str(self.prefix / 'bin/node') if n == 'node'
+                             else str(self.prefix / 'bin/npm-cli.js'))
+        self.addCleanup(which.stop)
+        which.start()
+
+    def run_install(self, helper_results, npm_returncode=0):
+        run = patch.object(U.subprocess, 'run',
+                           return_value=subprocess.CompletedProcess([], npm_returncode))
+        helper = patch.object(U, 'platform_helper_ok', side_effect=helper_results)
+        self.addCleanup(run.stop)
+        self.addCleanup(helper.stop)
+        return run.start(), helper.start()
+
+    def test_install_retries_once_when_helper_is_missing(self):
+        run, helper = self.run_install([False, True])
+        U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(helper.call_count, 2)
+
+    def test_install_fails_when_helper_stays_missing(self):
+        run, helper = self.run_install([False, False])
+        with self.assertRaises(RuntimeError):
+            U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(helper.call_count, 2)
+
+    def test_install_fails_without_helper_check_when_npm_fails(self):
+        run, helper = self.run_install([True], npm_returncode=1)
+        with self.assertRaises(RuntimeError):
+            U.install(self.prefix, '0.10.0', open(os.devnull, 'w'))
+        run.assert_called_once()
+        helper.assert_not_called()
 
 
 class BackupAndLockTests(unittest.TestCase):

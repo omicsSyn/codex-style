@@ -3,7 +3,7 @@ name: codex-style
 description: Maintain custom heading and emphasis colors in Codex CLI on Linux or WSL. Check status, restore colors after updates, adapt a version-matched renderer with backups and tests, or explicitly configure event-driven repair and scheduled stable npm updates.
 license: Apache-2.0
 metadata:
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
 # Codex CLI color maintenance
@@ -97,8 +97,11 @@ Unknown renderer changes require assistant inspection, not blind repeated builds
 The scheduled updater supports standard global npm installs only. It checks
 the official stable tag, skips same/older versions, saves verified package and
 native-executable backups, and installs the exact newer version into the checked
-prefix. It shares the maintenance lock with repair. Pending recovery journals
-block both workflows. A completed npm upgrade is not proof that color repair
+prefix. npm fetch failures of the large platform helper package are non-fatal
+for npm itself, so the updater uses a 3-attempt retry budget, verifies the
+installed `@openai/codex-<platform>` vendor binary after each npm run, and
+repeats the install once when it is missing before reporting failure. It shares
+the maintenance lock with repair. Pending recovery journals block both workflows. A completed npm upgrade is not proof that color repair
 has completed; check the two status records separately.
 
 Setup captures PATH and the resolved private runtime root. `--inherit-proxy`
